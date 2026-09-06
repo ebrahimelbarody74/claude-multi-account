@@ -251,6 +251,60 @@ assert_fail     'env of a missing account fails' "$CLI" env ghost
 assert_not_contains 'env output contains no eval' 'eval' "$CLI" env work
 
 # ---------------------------------------------------------------------------
+group 'link / unlink (shortcuts)'
+# ---------------------------------------------------------------------------
+# The shims are written next to the executable, so test a copy in its own dir.
+SHIMDIR="$WORK/shimbin"
+mkdir -p "$SHIMDIR"
+cp "$CLI" "$SHIMDIR/claude-account"
+SHIMCLI="$SHIMDIR/claude-account"
+
+assert_ok       'link work -> claude1' "$SHIMCLI" link work claude1
+assert_ok       'the shim exists and is executable' test -x "$SHIMDIR/claude1"
+assert_contains 'links lists it' 'claude1' "$SHIMCLI" links
+assert_contains 'links shows the account' 'work' "$SHIMCLI" links
+assert_not_contains 'links does not list the tool itself' 'claude-account' "$SHIMCLI" links
+
+# The shim must actually set CLAUDE_CONFIG_DIR for the work account.
+"$SHIMDIR/claude1" >/dev/null 2>&1
+assert_contains 'the shim runs the right account' "CLAUDE_CONFIG_DIR=$CLAUDE_ACCOUNTS_HOME/work" cat "$WORK/env.txt"
+
+# ...and pass arguments through untouched.
+"$SHIMDIR/claude1" -p 'hello world' >/dev/null 2>&1
+printf -- '-p\nhello world\n' > "$WORK/expected-shim-args.txt"
+if diff -q "$WORK/args.txt" "$WORK/expected-shim-args.txt" >/dev/null; then
+  ok 'the shim passes arguments through'
+else
+  bad 'the shim passes arguments through' "$(cat "$WORK/args.txt")"
+fi
+
+assert_ok       'link default -> claude0' "$SHIMCLI" link default claude0
+"$SHIMDIR/claude0" >/dev/null 2>&1
+assert_contains 'the default shim unsets CLAUDE_CONFIG_DIR' 'CLAUDE_CONFIG_DIR=<unset>' cat "$WORK/env.txt"
+
+assert_fail     'link refuses to shadow claude' "$SHIMCLI" link work claude
+assert_fail     'link refuses to shadow claude-account' "$SHIMCLI" link work claude-account
+assert_fail     'link refuses a hostile shortcut name' "$SHIMCLI" link work '../evil'
+assert_fail     'link refuses a missing account' "$SHIMCLI" link ghost claude9
+assert_fail     'link with one arg fails' "$SHIMCLI" link work
+assert_fail     'link over an existing shortcut fails' "$SHIMCLI" link nologin claude1
+assert_ok       'link --force repoints it' "$SHIMCLI" link nologin claude1 --force
+assert_contains 'the repoint took effect' 'nologin' "$SHIMCLI" links
+
+# It must refuse to overwrite a file it did not create.
+printf '#!/bin/sh\necho not ours\n' > "$SHIMDIR/notours"
+chmod +x "$SHIMDIR/notours"
+assert_fail 'link refuses to overwrite a foreign file' "$SHIMCLI" link work notours
+assert_contains 'the foreign file is intact' 'not ours' cat "$SHIMDIR/notours"
+
+assert_fail 'unlink refuses a foreign file' "$SHIMCLI" unlink notours
+assert_ok   'the foreign file survived' test -f "$SHIMDIR/notours"
+assert_fail 'unlink of a missing shortcut fails' "$SHIMCLI" unlink nosuch
+assert_ok   'unlink removes the shim' "$SHIMCLI" unlink claude1
+assert_ok   'the shim is gone' test ! -e "$SHIMDIR/claude1"
+assert_ok   'cleanup: unlink claude0' "$SHIMCLI" unlink claude0
+
+# ---------------------------------------------------------------------------
 group 'rename'
 # ---------------------------------------------------------------------------
 assert_ok       'rename work -> company' "$CLI" rename work company
@@ -292,13 +346,22 @@ if grep -nE '(^|[^_[:alnum:]])eval[[:space:]]' "$CLI" | grep -v '^\s*#' | grep -
 else
   ok 'the CLI never calls eval'
 fi
-# Every rm in the CLI must be the single guarded account removal.
+# Exactly one recursive delete in the CLI, and it is the guarded account removal.
 rm_lines="$(grep -nE '(^|[^[:alnum:]_])rm[[:space:]]+-' "$CLI" | grep -v '^\s*[0-9]*:\s*#')"
-if [ "$(printf '%s\n' "$rm_lines" | grep -c 'rm -rf -- "\$dir"')" = "1" ] && \
-   [ "$(printf '%s\n' "$rm_lines" | grep -c .)" = "1" ]; then
-  ok 'the CLI has exactly one rm, and it is the guarded account removal'
+recursive="$(printf '%s\n' "$rm_lines" | grep -E 'rm[[:space:]]+-[a-z]*r' || true)"
+if [ "$(printf '%s\n' "$recursive" | grep -c 'rm -rf -- "\$dir"')" = "1" ] && \
+   [ "$(printf '%s\n' "$recursive" | grep -c .)" = "1" ]; then
+  ok 'exactly one recursive delete, and it is the guarded account removal'
 else
-  bad 'the CLI has exactly one rm, and it is the guarded account removal' "$rm_lines"
+  bad 'exactly one recursive delete, and it is the guarded account removal' "$recursive"
+fi
+
+# Every other delete must be a single-file rm -f on a validated shim path.
+others="$(printf '%s\n' "$rm_lines" | grep -vE 'rm[[:space:]]+-[a-z]*r' || true)"
+if [ -z "$others" ] || [ "$(printf '%s\n' "$others" | grep -cE 'rm -f -- "\$(target|entry)"')" = "$(printf '%s\n' "$others" | grep -c .)" ]; then
+  ok 'every non-recursive delete targets a validated shim path'
+else
+  bad 'every non-recursive delete targets a validated shim path' "$others"
 fi
 if grep -qE 'rm[[:space:]]+-rf[[:space:]]+"?\$HOME"?[[:space:]]*$|rm[[:space:]]+-rf[[:space:]]+/[[:space:]]*$' "$CLI"; then
   bad 'the CLI never rm -rf a home path or /'

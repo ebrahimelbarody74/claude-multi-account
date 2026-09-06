@@ -61,6 +61,22 @@ if (-not $removed) {
     Write-Host 'No installed files found.' -ForegroundColor DarkGray
 }
 
+# --- generated shortcuts (shims) -----------------------------------------
+
+# Shims are tool artefacts, not user data, so they go. Accounts still stay.
+$shimMarker = 'claude-multi-account shim'
+if (Test-Path -LiteralPath $InstallDir) {
+    Get-ChildItem -LiteralPath $InstallDir -File -ErrorAction SilentlyContinue |
+        Where-Object { (Split-Path -Leaf $_.FullName) -notlike 'claude-account.*' } |
+        ForEach-Object {
+            $head = Get-Content -LiteralPath $_.FullName -TotalCount 5 -ErrorAction SilentlyContinue
+            if ($head -and (($head -join "`n") -match [regex]::Escape($shimMarker))) {
+                Remove-Item -LiteralPath $_.FullName -Force
+                Write-Ok "removed shortcut $($_.FullName)"
+            }
+        }
+}
+
 # --- the PATH entry -------------------------------------------------------
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

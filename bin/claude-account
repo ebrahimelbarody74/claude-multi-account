@@ -24,9 +24,14 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 # Account names that cannot be created, because they are commands or reserved.
 RESERVED_NAMES=(default add list ls use run remove rm delete rename mv status \
-                path env shell help version)
+                path env shell link unlink links help version)
 
 MAX_NAME_LEN=64
+
+# Shim names that must never be created. "claude" is the important one: a shim
+# by that name would be found by this tool's own `claude` lookup, and the shim
+# would call itself forever.
+RESERVED_LINKS=(claude claude-account claude_account node npm npx git sh bash zsh env sudo)
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -103,6 +108,22 @@ require_account() {
 require_claude() {
   command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die \
     "'$CLAUDE_BIN' was not found on PATH. Install Claude Code first: https://claude.com/claude-code"
+}
+
+# The directory this executable lives in — where shims are created, so they land
+# on the same PATH entry the user already has.
+self_dir() {
+  local src="${BASH_SOURCE[0]}" target hops=0
+  while [ -L "$src" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 20 ] || die "too many symlinks while locating $PROG"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *)  src="$(dirname -- "$src")/$target" ;;
+    esac
+  done
+  (cd -- "$(dirname -- "$src")" && pwd)
 }
 
 ensure_accounts_home() {
@@ -237,6 +258,14 @@ cmd_list() {
   for name in "${names[@]}"; do
     print_row "$name" "$ACCOUNTS_HOME/$name" "$(auth_status_json "$ACCOUNTS_HOME/$name")"
   done
+
+  local links; links="$(each_link)"
+  if [ -n "$links" ]; then
+    printf '\n%sShortcuts%s\n' "$C_BOLD" "$C_RESET"
+    printf '%s\n' "$links" | while IFS="$(printf '\t')" read -r lname laccount; do
+      printf '  %-16s -> %s\n' "$lname" "$laccount"
+    done
+  fi
 }
 
 # print_row <name> <dir|""> <json>
@@ -435,6 +464,131 @@ cmd_shell() {
   exec env CLAUDE_CONFIG_DIR="$dir" CLAUDE_ACCOUNT="$name" "$sh"
 }
 
+# A shim is a tiny executable that runs one account. It carries a marker line so
+# unlink and the uninstaller can tell it apart from unrelated files.
+SHIM_MARKER="claude-multi-account shim"
+
+# True only for a generated shim. The marker must be near the top, which keeps
+# this tool's own source -- where the marker appears inside the generator -- from
+# being mistaken for a shim.
+is_shim() {
+  [ -f "$1" ] || return 1
+  case "$(basename -- "$1")" in
+    claude-account) return 1 ;;
+  esac
+  head -n 5 -- "$1" 2>/dev/null | grep -Fq "$SHIM_MARKER"
+}
+
+shim_account() {
+  sed -n -E 's/^# account: (.*)$/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+cmd_link() {
+  local account="${1-}" linkname="${2-}" force=0
+  shift 2 2>/dev/null || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      *) die "unknown option for 'link': $1" ;;
+    esac
+  done
+
+  if [ -z "$account" ] || [ -z "$linkname" ]; then
+    die "usage: $PROG link <account> <shortcut>   (example: $PROG link work claude1)"
+  fi
+
+  validate_name "$account"
+  validate_name "$linkname"
+
+  if [ "$account" != "default" ]; then
+    require_account "$account"
+  fi
+
+  local reserved
+  for reserved in "${RESERVED_LINKS[@]}"; do
+    if [ "$linkname" = "$reserved" ]; then
+      die "'$linkname' is not allowed as a shortcut — it would shadow the real '$reserved' command"
+    fi
+  done
+
+  local dir target
+  dir="$(self_dir)" || exit 1
+  target="$dir/$linkname"
+
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if ! is_shim "$target"; then
+      die "'$target' already exists and was not created by $PROG — refusing to overwrite it"
+    fi
+    if [ "$force" -eq 0 ]; then
+      local existing; existing="$(shim_account "$target")"
+      die "shortcut '$linkname' already points at '${existing:-another account}' (re-run with --force to repoint it)"
+    fi
+  fi
+
+  # Refuse to shadow an unrelated command that is already on PATH.
+  local found
+  if found="$(command -v "$linkname" 2>/dev/null)"; then
+    if [ "$found" != "$target" ] && ! is_shim "$found"; then
+      die "'$linkname' is already a command on your PATH ($found) — pick another name"
+    fi
+  fi
+
+  local self="$dir/$PROG"
+  [ -x "$self" ] || self="$dir/claude-account"
+
+  cat > "$target" <<SHIM || die "could not write $target"
+#!/usr/bin/env bash
+# $SHIM_MARKER
+# account: $account
+# Created by: $PROG link $account $linkname
+exec "$self" use "$account" "\$@"
+SHIM
+
+  chmod 755 "$target" || die "could not make $target executable"
+  info "${C_GREEN}created${C_RESET} shortcut '$linkname' -> account '$account'"
+  info "Run it with: ${C_BOLD}$linkname${C_RESET}   (arguments pass through, e.g. $linkname -p \"hi\")"
+}
+
+cmd_unlink() {
+  local linkname="${1-}"
+  [ -n "$linkname" ] || die "usage: $PROG unlink <shortcut>"
+  validate_name "$linkname"
+
+  local dir target
+  dir="$(self_dir)" || exit 1
+  target="$dir/$linkname"
+
+  [ -e "$target" ] || die "no such shortcut: '$linkname'"
+  is_shim "$target" || die "'$target' was not created by $PROG — refusing to delete it"
+
+  rm -f -- "$target" || die "could not remove $target"
+  info "${C_GREEN}removed${C_RESET} shortcut '$linkname'"
+}
+
+# Prints "name -> account" for every shim next to this executable.
+each_link() {
+  local dir entry name account
+  dir="$(self_dir)" 2>/dev/null || return 0
+  for entry in "$dir"/*; do
+    is_shim "$entry" || continue
+    name="$(basename -- "$entry")"
+    account="$(shim_account "$entry")"
+    printf '%s\t%s\n' "$name" "${account:-?}"
+  done
+}
+
+cmd_links() {
+  local out; out="$(each_link)"
+  if [ -z "$out" ]; then
+    info "No shortcuts yet. Create one with: $PROG link work claude1"
+    return 0
+  fi
+  printf '%s%-18s %s%s\n' "$C_BOLD" "SHORTCUT" "ACCOUNT" "$C_RESET"
+  printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r name account; do
+    printf '%-18s %s\n' "$name" "$account"
+  done
+}
+
 cmd_help() {
   cat <<EOF
 ${C_BOLD}claude-account${C_RESET} $VERSION — run several Claude Code accounts side by side.
@@ -452,6 +606,9 @@ ${C_BOLD}COMMANDS${C_RESET}
   status [name]             Show sign-in details for one account
   remove <name> [--yes]     Delete a stored account session
   rename <old> <new>        Rename an account
+  link <account> <name>     Create a short command, e.g. 'link work claude1'
+  unlink <name>             Remove a shortcut
+  links                     List the shortcuts
   path <name>               Print the account's config directory
   env <name>                Print the export line for that account
   shell <name>              Open a subshell pointed at that account
@@ -466,6 +623,10 @@ ${C_BOLD}EXAMPLES${C_RESET}
   $PROG use personal --model opus
   $PROG default                      # your normal, untouched Claude Code
   $PROG status work
+
+  $PROG link work claude1            # now 'claude1' runs the work account
+  $PROG link personal claude2        # and 'claude2' runs the personal one
+  claude1 -p "hi"                    # arguments still pass through
 
 ${C_BOLD}HOW IT WORKS${C_RESET}
   Every account is its own CLAUDE_CONFIG_DIR under
@@ -502,6 +663,9 @@ main() {
     status)             cmd_status "${1-}" ;;
     remove|rm|delete)   cmd_remove "$@" ;;
     rename|mv)          cmd_rename "${1-}" "${2-}" ;;
+    link)               cmd_link "$@" ;;
+    unlink)             cmd_unlink "${1-}" ;;
+    links)              cmd_links ;;
     path)               cmd_path "${1-}" ;;
     env)                cmd_env "${1-}" ;;
     shell)              cmd_shell "${1-}" ;;

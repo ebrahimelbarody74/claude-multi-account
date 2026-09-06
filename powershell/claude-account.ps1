@@ -31,8 +31,15 @@ $script:MaxNameLength = 64
 # Account names that cannot be created, because they are commands or reserved.
 $script:Reserved = @(
     'default','add','list','ls','use','run','remove','rm','delete',
-    'rename','mv','status','path','env','shell','help','version'
+    'rename','mv','status','path','env','shell','link','unlink','links',
+    'help','version'
 )
+
+# Shim names that must never be created. 'claude' is the important one: a shim by
+# that name would be found by this tool's own claude lookup and call itself.
+$script:ReservedLinks = @('claude','claude-account','node','npm','npx','git','pwsh','powershell','cmd')
+
+$script:ShimMarker = 'claude-multi-account shim'
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -320,6 +327,13 @@ function Invoke-List {
     foreach ($d in $dirs) {
         Write-AccountRow $d.Name $d.FullName (Get-AuthStatus $d.FullName)
     }
+
+    $links = Get-Links
+    if ($links.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Shortcuts'
+        foreach ($l in $links) { Write-Host ('  {0,-16} -> {1}' -f $l.Name, $l.Account) }
+    }
 }
 
 function Invoke-Status {
@@ -498,6 +512,123 @@ function Invoke-Shell {
     exit $LASTEXITCODE
 }
 
+# --- shortcuts (link / unlink / links) ------------------------------------
+
+function Get-SelfDir {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return (Split-Path -Parent $MyInvocation.MyCommand.Path)
+}
+
+# True only for a generated shim. The marker must be near the top, which keeps
+# this tool's own source -- where the marker appears inside the generator --
+# from being mistaken for a shim.
+function Test-Shim {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if ((Split-Path -Leaf $Path) -like 'claude-account.*') { return $false }
+    $head = Get-Content -LiteralPath $Path -TotalCount 5 -ErrorAction SilentlyContinue
+    if (-not $head) { return $false }
+    return (($head -join "`n") -match [regex]::Escape($script:ShimMarker))
+}
+
+function Get-ShimAccount {
+    param([string]$Path)
+    $head = Get-Content -LiteralPath $Path -TotalCount 5 -ErrorAction SilentlyContinue
+    foreach ($line in $head) {
+        if ($line -match '^\s*(?:rem|#)\s*account:\s*(.+?)\s*$') { return $Matches[1] }
+    }
+    return '?'
+}
+
+function Get-Links {
+    $dir = Get-SelfDir
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+             Where-Object { Test-Shim $_.FullName } |
+             ForEach-Object { [pscustomobject]@{ Name = $_.BaseName; Account = (Get-ShimAccount $_.FullName) } })
+}
+
+function Invoke-Link {
+    param([string[]]$Rest)
+
+    $account = $null; $linkName = $null; $force = $false
+    foreach ($arg in $Rest) {
+        if ($arg -eq '-f' -or $arg -eq '--force') { $force = $true; continue }
+        if ($arg.StartsWith('-')) { Stop-WithError "unknown option for 'link': $arg" }
+        if (-not $account)      { $account = $arg; continue }
+        if (-not $linkName)     { $linkName = $arg; continue }
+        Stop-WithError "'link' takes an account and a shortcut name"
+    }
+
+    if (-not $account -or -not $linkName) {
+        Stop-WithError "usage: $($script:Prog) link <account> <shortcut>   (example: $($script:Prog) link work claude1)"
+    }
+
+    Assert-ValidName $account
+    Assert-ValidName $linkName
+    if ($account -ne 'default') { Assert-AccountExists $account }
+
+    if ($script:ReservedLinks -contains $linkName.ToLowerInvariant()) {
+        Stop-WithError "'$linkName' is not allowed as a shortcut - it would shadow the real '$linkName' command"
+    }
+
+    $dir    = Get-SelfDir
+    $target = Join-Path $dir "$linkName.cmd"
+
+    if (Test-Path -LiteralPath $target) {
+        if (-not (Test-Shim $target)) {
+            Stop-WithError "'$target' already exists and was not created by $($script:Prog) - refusing to overwrite it"
+        }
+        if (-not $force) {
+            Stop-WithError "shortcut '$linkName' already points at '$(Get-ShimAccount $target)' (re-run with --force to repoint it)"
+        }
+    }
+
+    $existing = Get-Command $linkName -ErrorAction SilentlyContinue
+    if ($existing -and $existing.Source -and ($existing.Source -ne $target) -and -not (Test-Shim $existing.Source)) {
+        Stop-WithError "'$linkName' is already a command on your PATH ($($existing.Source)) - pick another name"
+    }
+
+    $shim = @"
+@echo off
+rem $($script:ShimMarker)
+rem account: $account
+rem Created by: $($script:Prog) link $account $linkName
+setlocal
+set "PSEXE=powershell.exe"
+where pwsh.exe >nul 2>&1 && set "PSEXE=pwsh.exe"
+"%PSEXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0claude-account.ps1" use $account %*
+exit /b %ERRORLEVEL%
+"@
+    Set-Content -LiteralPath $target -Value $shim -Encoding ASCII
+    Write-Host "created shortcut '$linkName' -> account '$account'" -ForegroundColor Green
+    Write-Info "Run it with: $linkName   (arguments pass through, e.g. $linkName -p ""hi"")"
+}
+
+function Invoke-Unlink {
+    param([string]$LinkName)
+    if (-not $LinkName) { Stop-WithError "usage: $($script:Prog) unlink <shortcut>" }
+    Assert-ValidName $LinkName
+
+    $target = Join-Path (Get-SelfDir) "$LinkName.cmd"
+    if (-not (Test-Path -LiteralPath $target)) { Stop-WithError "no such shortcut: '$LinkName'" }
+    if (-not (Test-Shim $target)) {
+        Stop-WithError "'$target' was not created by $($script:Prog) - refusing to delete it"
+    }
+    Remove-Item -LiteralPath $target -Force
+    Write-Host "removed shortcut '$LinkName'" -ForegroundColor Green
+}
+
+function Invoke-Links {
+    $links = Get-Links
+    if ($links.Count -eq 0) {
+        Write-Info "No shortcuts yet. Create one with: $($script:Prog) link work claude1"
+        return
+    }
+    Write-Host ('{0,-18} {1}' -f 'SHORTCUT','ACCOUNT')
+    foreach ($l in $links) { Write-Host ('{0,-18} {1}' -f $l.Name, $l.Account) }
+}
+
 function Invoke-Help {
     @"
 claude-account $($script:Version) - run several Claude Code accounts side by side.
@@ -515,6 +646,9 @@ COMMANDS
   status [name]             Show sign-in details for one account
   remove <name> [--yes]     Delete a stored account session
   rename <old> <new>        Rename an account
+  link <account> <name>     Create a short command, e.g. 'link work claude1'
+  unlink <name>             Remove a shortcut
+  links                     List the shortcuts
   path <name>               Print the account's config directory
   env <name>                Print the assignment line for that account
   shell <name>              Open a child shell pointed at that account
@@ -529,6 +663,10 @@ EXAMPLES
   $($script:Prog) use personal --model opus
   $($script:Prog) default                     # your normal, untouched Claude Code
   $($script:Prog) status work
+
+  $($script:Prog) link work claude1            # now 'claude1' runs the work account
+  $($script:Prog) link personal claude2        # and 'claude2' runs the personal one
+  claude1 -p "hi"                              # arguments still pass through
 
   If PowerShell tries to interpret a Claude flag as its own, stop parsing:
   $($script:Prog) work --% -p "summarise README"
@@ -573,6 +711,9 @@ switch -Regex ($command) {
     '^status$'                  { Invoke-Status $arg1; break }
     '^(remove|rm|delete)$'      { Invoke-Remove $rest; break }
     '^(rename|mv)$'             { Invoke-Rename $arg1 $arg2; break }
+    '^link$'                    { Invoke-Link $rest; break }
+    '^unlink$'                  { Invoke-Unlink $arg1; break }
+    '^links$'                   { Invoke-Links; break }
     '^path$'                    { Invoke-Path $arg1; break }
     '^env$'                     { Invoke-Env $arg1; break }
     '^shell$'                   { Invoke-Shell $arg1; break }

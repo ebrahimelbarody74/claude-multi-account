@@ -243,6 +243,53 @@ AssertContains 'env default removes the var' 'Remove-Item' @('env','default')
 AssertFail     'env of a missing account fails' @('env','ghost')
 
 # ---------------------------------------------------------------------------
+Group 'link / unlink (shortcuts)'
+# Shims live next to the executable, so exercise a copy in its own directory.
+$ShimDir = Join-Path $Work 'shimbin'
+New-Item -ItemType Directory -Path $ShimDir -Force | Out-Null
+Copy-Item -LiteralPath $Cli -Destination (Join-Path $ShimDir 'claude-account.ps1')
+$ShimCli = Join-Path $ShimDir 'claude-account.ps1'
+
+function RunShimCli {
+    param([string[]]$CliArguments)
+    $exe = (Get-Process -Id $PID).Path
+    $all = @('-NoLogo','-NoProfile','-File', $ShimCli) + $CliArguments
+    $out = & $exe @all 2>&1 | Out-String
+    return @{ Output = $out; Code = $LASTEXITCODE }
+}
+function AssertShimOk   { param($n, [string[]]$a) $r = RunShimCli $a; if ($r.Code -eq 0) { Ok $n } else { Bad $n "exit $($r.Code): $($r.Output)" } }
+function AssertShimFail { param($n, [string[]]$a) $r = RunShimCli $a; if ($r.Code -ne 0) { Ok $n } else { Bad $n "expected failure: $($r.Output)" } }
+function AssertShimHas  { param($n, $needle, [string[]]$a) $r = RunShimCli $a; if ($r.Output -like "*$needle*") { Ok $n } else { Bad $n "expected '$needle' in: $($r.Output)" } }
+
+AssertShimOk   'link work -> claude1' @('link','work','claude1')
+if (Test-Path -LiteralPath (Join-Path $ShimDir 'claude1.cmd')) { Ok 'the shim file exists' } else { Bad 'the shim file exists' }
+AssertShimHas  'links lists it' 'claude1' @('links')
+AssertShimHas  'links shows the account' 'work' @('links')
+$linksOut = (RunShimCli @('links')).Output
+if ($linksOut -notlike '*claude-account*') { Ok 'links does not list the tool itself' } else { Bad 'links does not list the tool itself' $linksOut }
+
+AssertShimOk   'link default -> claude0' @('link','default','claude0')
+AssertShimFail 'link refuses to shadow claude' @('link','work','claude')
+AssertShimFail 'link refuses to shadow claude-account' @('link','work','claude-account')
+AssertShimFail 'link refuses a hostile shortcut name' @('link','work','../evil')
+AssertShimFail 'link refuses a missing account' @('link','ghost','claude9')
+AssertShimFail 'link with one arg fails' @('link','work')
+AssertShimFail 'link over an existing shortcut fails' @('link','nologin','claude1')
+AssertShimOk   'link --force repoints it' @('link','nologin','claude1','--force')
+AssertShimHas  'the repoint took effect' 'nologin' @('links')
+
+$foreign = Join-Path $ShimDir 'notours.cmd'
+Set-Content -LiteralPath $foreign -Value "@echo off`r`necho not ours" -Encoding ASCII
+AssertShimFail 'link refuses to overwrite a foreign file' @('link','work','notours')
+if ((Get-Content -LiteralPath $foreign -Raw) -like '*not ours*') { Ok 'the foreign file is intact' } else { Bad 'the foreign file is intact' }
+AssertShimFail 'unlink refuses a foreign file' @('unlink','notours')
+if (Test-Path -LiteralPath $foreign) { Ok 'the foreign file survived' } else { Bad 'the foreign file survived' }
+AssertShimFail 'unlink of a missing shortcut fails' @('unlink','nosuch')
+AssertShimOk   'unlink removes the shim' @('unlink','claude1')
+if (-not (Test-Path -LiteralPath (Join-Path $ShimDir 'claude1.cmd'))) { Ok 'the shim is gone' } else { Bad 'the shim is gone' }
+AssertShimOk   'cleanup: unlink claude0' @('unlink','claude0')
+
+# ---------------------------------------------------------------------------
 Group 'rename'
 AssertOk       'rename work -> company' @('rename','work','company')
 if (Test-Path -LiteralPath (Join-Path $env:CLAUDE_ACCOUNTS_HOME 'company')) { Ok 'new dir exists' } else { Bad 'new dir exists' }

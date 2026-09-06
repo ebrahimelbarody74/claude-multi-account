@@ -122,6 +122,9 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 | `claude-account status work` | Email, plan, org and login status for one account |
 | `claude-account remove work` | Delete that stored account (asks first; `--yes` skips) |
 | `claude-account rename work company` | Rename an account, session intact |
+| `claude-account link work claude1` | Create a short command: `claude1` now runs the `work` account |
+| `claude-account links` | List the shortcuts |
+| `claude-account unlink claude1` | Remove a shortcut |
 | `claude-account path work` | Print the account's config directory |
 | `claude-account env work` | Print the `export` line, for your own scripts |
 | `claude-account shell work` | Open a subshell already pointed at `work` |
@@ -179,12 +182,35 @@ claude-account rename work company
 claude-account remove personal
 ```
 
-Handy shell aliases:
+### Shorter commands
+
+`link` writes a tiny executable next to `claude-account`, so the shortcut works
+everywhere — scripts, cron, any shell — not just an interactive session:
+
+```bash
+claude-account link work claude1
+claude-account link personal claude2
+claude-account link default claude0
+
+claude1                       # a session on the work account
+claude1 -p "fix this test"    # arguments still pass through
+claude2 --model opus
+
+claude-account links          # SHORTCUT  ACCOUNT
+                              # claude1   work
+                              # claude2   personal
+claude-account unlink claude1
+```
+
+A shell alias also works, but only inside an interactive shell of that type:
 
 ```bash
 alias cw='claude-account work'
-alias cp='claude-account personal'
 ```
+
+> **A shell alias beats a shortcut.** If `claude1` is already an `alias` in your
+> `~/.zshrc`, the alias wins and the shortcut is never reached. Delete the alias
+> first, or `hash -r` after removing it.
 
 ### Windows (PowerShell)
 
@@ -222,11 +248,25 @@ claude-account rename work company
 claude-account remove personal
 ```
 
-Handy PowerShell functions (add them to `$PROFILE`):
+### Shorter commands
+
+```powershell
+claude-account link work claude1
+claude-account link personal claude2
+
+claude1                       # a session on the work account
+claude1 -p "fix this test"    # arguments still pass through
+
+claude-account links
+claude-account unlink claude1
+```
+
+`link` writes a `.cmd` shim next to `claude-account`, so it works from
+PowerShell and `cmd.exe` alike. A `$PROFILE` function also works, inside
+PowerShell only:
 
 ```powershell
 function cw { claude-account work @args }
-function cpn { claude-account personal @args }
 ```
 
 > **If PowerShell swallows a flag.** PowerShell parses `-something` before your
@@ -310,6 +350,11 @@ This tool is deliberately boring. It stores nothing of its own.
   executable and the `PATH` entry, then print where your accounts still are so
   you can delete them yourself if you want to.
 - **Account directories are created `0700`** (owner-only) on macOS and Linux.
+- **Shortcuts cannot hijack a command.** `link` refuses reserved names — `claude`
+  above all, since a shim by that name would call itself forever — refuses to
+  overwrite any file it did not write, and refuses a name that already resolves
+  to an unrelated command on your `PATH`. `unlink` deletes only files carrying
+  its own marker.
 
 The test suites include the hostile-input cases above; see
 [`tests/`](tests/).
@@ -342,6 +387,11 @@ running `claude-account.ps1` directly.
 
 **PowerShell: a flag is being eaten.**
 Use the stop-parsing token: `claude-account work --% -p "hi"`.
+
+**My shortcut runs the wrong account.**
+A shell alias of the same name takes priority over the shim. Check with
+`type claude1` (zsh/bash) or `Get-Command claude1` (PowerShell); if it reports
+an alias, remove it from your `~/.zshrc` or `$PROFILE`.
 
 **I want to see exactly what will run.**
 `claude-account path work` prints the directory; the command is always

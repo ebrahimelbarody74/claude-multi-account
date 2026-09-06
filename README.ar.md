@@ -131,6 +131,9 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 | `claude-account status work` | البريد والخطة والمؤسسة وحالة الدخول لحساب واحد |
 | `claude-account remove work` | يحذف الحساب المخزَّن (يسأل أولًا؛ `--yes` يتخطى السؤال) |
 | `claude-account rename work company` | يعيد تسمية حساب مع الحفاظ على جلسته |
+| `claude-account link work claude1` | ينشئ أمرًا مختصرًا: `claude1` يشغّل حساب `work` |
+| `claude-account links` | يعرض قائمة المختصرات |
+| `claude-account unlink claude1` | يحذف مختصرًا |
 | `claude-account path work` | يطبع مجلد إعدادات الحساب |
 | `claude-account env work` | يطبع سطر `export` لاستخدامه في سكربتاتك |
 | `claude-account shell work` | يفتح shell فرعيًا موجَّهًا إلى `work` |
@@ -192,14 +195,43 @@ claude-account remove personal
 
 <div dir="rtl">
 
-اختصارات مفيدة:
+### أوامر أقصر
+
+الأمر `link` يكتب ملفًا تنفيذيًا صغيرًا بجوار `claude-account`، فيعمل المختصر في
+كل مكان — سكربتات، cron، أي shell — وليس في الجلسة التفاعلية فقط:
+
+</div>
+
+```bash
+claude-account link work claude1
+claude-account link personal claude2
+claude-account link default claude0
+
+claude1                       # جلسة على حساب العمل
+claude1 -p "fix this test"    # الوسائط تُمرَّر كما هي
+claude2 --model opus
+
+claude-account links          # SHORTCUT  ACCOUNT
+                              # claude1   work
+                              # claude2   personal
+claude-account unlink claude1
+```
+
+<div dir="rtl">
+
+الـ alias يعمل أيضًا، لكن داخل shell تفاعلي من نوعه فقط:
 
 </div>
 
 ```bash
 alias cw='claude-account work'
-alias cp='claude-account personal'
 ```
+
+<div dir="rtl">
+
+> **الـ alias يتغلّب على المختصر.** لو كان `claude1` موجودًا أصلًا كـ `alias` في
+> `~/.zshrc`، فالـ alias هو الذي ينفَّذ ولن يصل الأمر إلى المختصر. احذف الـ alias
+> أولًا، ثم `hash -r`.
 
 <div dir="rtl">
 
@@ -242,13 +274,30 @@ claude-account remove personal
 
 <div dir="rtl">
 
-دوال مفيدة لملف `$PROFILE`:
+### أوامر أقصر
+
+</div>
+
+```powershell
+claude-account link work claude1
+claude-account link personal claude2
+
+claude1                       # جلسة على حساب العمل
+claude1 -p "fix this test"    # الوسائط تُمرَّر كما هي
+
+claude-account links
+claude-account unlink claude1
+```
+
+<div dir="rtl">
+
+الأمر `link` يكتب ملف `.cmd` بجوار `claude-account`، فيعمل من PowerShell ومن
+`cmd.exe` على السواء. ودالة في `$PROFILE` تعمل أيضًا، داخل PowerShell فقط:
 
 </div>
 
 ```powershell
 function cw { claude-account work @args }
-function cpn { claude-account personal @args }
 ```
 
 <div dir="rtl">
@@ -342,6 +391,10 @@ CLAUDE_CONFIG_DIR=~/.claude-accounts/work claude "$@"
 - **إزالة التثبيت لا تحذف الحسابات أبدًا.** يزيل المُزيل الملف التنفيذي ومدخل
   `PATH` فقط، ثم يطبع مكان حساباتك لتحذفها بنفسك إن أردت.
 - **تُنشأ مجلدات الحسابات بصلاحيات `0700`** (للمالك فقط) على macOS و Linux.
+- **المختصرات لا يمكنها اختطاف أمر قائم.** يرفض `link` الأسماء المحجوزة — وعلى
+  رأسها `claude`، لأن مختصرًا بهذا الاسم سيستدعي نفسه إلى ما لا نهاية — ويرفض
+  الكتابة فوق أي ملف لم يُنشئه، ويرفض اسمًا يشير أصلًا إلى أمر آخر في `PATH`.
+  و`unlink` لا يحذف إلا الملفات التي تحمل علامته.
 
 وحالات المدخلات العدائية أعلاه مغطّاة في مجموعتَي الاختبارات؛ انظر
 [`tests/`](tests/).
@@ -374,6 +427,11 @@ CLAUDE_CONFIG_DIR=~/.claude-accounts/work claude "$@"
 
 **PowerShell: أحد الخيارات يُبتلع.**
 استخدم رمز إيقاف التحليل: `claude-account work --% -p "hi"`.
+
+**المختصر يشغّل الحساب الخطأ.**
+الـ alias الذي يحمل الاسم نفسه له الأولوية على المختصر. تحقّق بـ
+`type claude1` (zsh/bash) أو `Get-Command claude1` (PowerShell)؛ فإن ظهر أنه
+alias، احذفه من `~/.zshrc` أو `$PROFILE`.
 
 **أريد أن أرى بالضبط ما سيُنفَّذ.**
 `claude-account path work` يطبع المجلد؛ والأمر دائمًا هو

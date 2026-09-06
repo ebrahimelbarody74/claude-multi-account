@@ -61,6 +61,21 @@ if [ "$removed" -eq 0 ]; then
   info "${C_DIM}No installed executable found.${C_RESET}"
 fi
 
+# --- generated shortcuts (shims) -----------------------------------------
+
+# Shims are tool artefacts, not user data, so they go. Accounts still stay.
+SHIM_MARKER="claude-multi-account shim"
+for entry in "$INSTALL_DIR"/*; do
+  [ -f "$entry" ] || continue
+  case "$(basename -- "$entry")" in claude-account) continue ;; esac
+  head -n 5 -- "$entry" 2>/dev/null | grep -Fq "$SHIM_MARKER" || continue
+  if rm -f -- "$entry"; then
+    info "${C_GREEN}removed${C_RESET} shortcut $entry"
+  else
+    warn "could not remove $entry"
+  fi
+done
+
 # --- the PATH line --------------------------------------------------------
 
 for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
