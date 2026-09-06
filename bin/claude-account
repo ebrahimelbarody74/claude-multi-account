@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+#
+# claude-account — run and switch between multiple Claude Code accounts.
+#
+# Each account is an isolated CLAUDE_CONFIG_DIR. HOME is never modified, so the
+# macOS Keychain keeps working normally.
+#
+# https://github.com/ebrahimelbarody74/claude-multi-account
+
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Where account config dirs live. Override with CLAUDE_ACCOUNTS_HOME.
+ACCOUNTS_HOME="${CLAUDE_ACCOUNTS_HOME:-$HOME/.claude-accounts}"
+
+# The Claude Code executable. Override with CLAUDE_BIN.
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+# Account names that cannot be created, because they are commands or reserved.
+RESERVED_NAMES=(default add list ls use run remove rm delete rename mv status \
+                path env shell help version)
+
+MAX_NAME_LEN=64
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+fi
+
+info() { printf '%s\n' "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Validation — this is the path-traversal guard
+# ---------------------------------------------------------------------------
+
+# Accept only [A-Za-z0-9._-], never leading '.' or '-', never '.'/'..'.
+# This makes "../../etc", "a/b", "~", and absolute paths impossible.
+validate_name() {
+  local name="${1-}"
+
+  [ -n "$name" ] || die "account name cannot be empty"
+
+  if [ "${#name}" -gt "$MAX_NAME_LEN" ]; then
+    die "account name is too long (max $MAX_NAME_LEN characters)"
+  fi
+
+  case "$name" in
+    .|..)
+      die "'$name' is not a valid account name" ;;
+    .*)
+      die "account name cannot start with '.'" ;;
+    -*)
+      die "account name cannot start with '-'" ;;
+    *[!A-Za-z0-9._-]*)
+      die "invalid account name '$name' (allowed: letters, digits, '.', '_', '-')" ;;
+  esac
+}
+
+reject_reserved() {
+  local name="$1" reserved
+  for reserved in "${RESERVED_NAMES[@]}"; do
+    if [ "$name" = "$reserved" ]; then
+      die "'$name' is a reserved name and cannot be used for an account"
+    fi
+  done
+}
+
+# Resolve an account directory, then assert it really sits directly inside
+# ACCOUNTS_HOME. Belt and braces on top of validate_name.
+account_dir() {
+  local name="$1"
+  validate_name "$name"
+  local dir="$ACCOUNTS_HOME/$name"
+  if [ "$dir" != "$ACCOUNTS_HOME/$(basename -- "$dir")" ]; then
+    die "refusing to operate on a path outside $ACCOUNTS_HOME"
+  fi
+  printf '%s' "$dir"
+}
+
+account_exists() {
+  [ -d "$ACCOUNTS_HOME/$1" ]
+}
+
+require_account() {
+  local name="$1"
+  account_exists "$name" || die "no such account: '$name' (run '$PROG list', or '$PROG add $name')"
+}
+
+require_claude() {
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die \
+    "'$CLAUDE_BIN' was not found on PATH. Install Claude Code first: https://claude.com/claude-code"
+}
+
+ensure_accounts_home() {
+  if [ ! -d "$ACCOUNTS_HOME" ]; then
+    mkdir -p "$ACCOUNTS_HOME" || die "could not create $ACCOUNTS_HOME"
+  fi
+  chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Reading `claude auth status --json` without depending on jq
+# ---------------------------------------------------------------------------
+
+# The JSON is pretty-printed, one key per line, so a line-oriented sed is safe.
+# -E (extended regex) is required: BSD sed on macOS has no \| alternation in BRE.
+json_str() {
+  printf '%s\n' "$1" | sed -n -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1
+}
+json_bool() {
+  printf '%s\n' "$1" | sed -n -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*(true|false).*/\1/p' | head -n1
+}
+
+# auth_status_json <config-dir|"">  — empty means the default (unset) account.
+auth_status_json() {
+  local dir="${1-}"
+  if [ -n "$dir" ]; then
+    CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" auth status --json 2>/dev/null
+  else
+    env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" auth status --json 2>/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Running Claude Code under an account
+# ---------------------------------------------------------------------------
+
+# run_account <name> [args...]
+run_account() {
+  local name="$1"; shift
+  require_claude
+  require_account "$name"
+  local dir; dir="$(account_dir "$name")" || exit 1
+  # `env` scopes the variable to the child only; `exec` keeps signals and the
+  # real exit code. No eval, no shell re-parsing of "$@".
+  exec env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" "$@"
+}
+
+# run_default [args...] — plain Claude Code, with CLAUDE_CONFIG_DIR removed so
+# an inherited value from the surrounding shell cannot leak in.
+run_default() {
+  require_claude
+  exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_add() {
+  local name="" do_login=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-login) do_login=0; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option for 'add': $1" ;;
+      *)  [ -z "$name" ] || die "'add' takes exactly one account name"; name="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$name" ] || die "usage: $PROG add <name>"
+  validate_name "$name"
+  reject_reserved "$name"
+  require_claude
+  ensure_accounts_home
+
+  local dir="$ACCOUNTS_HOME/$name"
+  if [ -d "$dir" ]; then
+    die "account '$name' already exists ($dir)"
+  fi
+
+  mkdir -p "$dir" || die "could not create $dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  info "${C_GREEN}created${C_RESET} account '$name' at $dir"
+
+  if [ "$do_login" -eq 0 ]; then
+    info "Skipped sign-in. Run '$PROG $name' when you are ready to log in."
+    return 0
+  fi
+
+  info ""
+  info "Signing in to '$name'. Use the email address for this account."
+  info ""
+  CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" auth login
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    warn "sign-in did not complete (exit $rc). The account directory was kept."
+    warn "Retry with: $PROG $name    (or remove it with: $PROG remove $name)"
+    return $rc
+  fi
+
+  info ""
+  cmd_status "$name"
+}
+
+cmd_list() {
+  require_claude
+
+  if [ ! -d "$ACCOUNTS_HOME" ]; then
+    info "No accounts yet. Create one with: $PROG add work"
+    return 0
+  fi
+
+  local names=() entry base
+  for entry in "$ACCOUNTS_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    base="$(basename -- "$entry")"
+    case "$base" in .*) continue ;; esac
+    names+=("$base")
+  done
+
+  printf '%s%-18s %-34s %-10s %s%s\n' "$C_BOLD" "ACCOUNT" "EMAIL" "PLAN" "STATUS" "$C_RESET"
+
+  # The built-in "default" account: whatever ~/.claude already holds.
+  print_row "default" "" "$(auth_status_json "")"
+
+  if [ ${#names[@]} -eq 0 ]; then
+    printf '%s\n' "${C_DIM}(no named accounts yet — create one with: $PROG add work)${C_RESET}"
+    return 0
+  fi
+
+  local name
+  for name in "${names[@]}"; do
+    print_row "$name" "$ACCOUNTS_HOME/$name" "$(auth_status_json "$ACCOUNTS_HOME/$name")"
+  done
+}
+
+# print_row <name> <dir|""> <json>
+print_row() {
+  local name="$1" dir="$2" json="$3"
+  local email plan logged status marker=""
+
+  email="$(json_str "$json" email)"
+  plan="$(json_str "$json" subscriptionType)"
+  logged="$(json_bool "$json" loggedIn)"
+
+  [ -n "$email" ] || email="-"
+  [ -n "$plan" ] || plan="-"
+
+  if [ "$logged" = "true" ]; then
+    status="${C_GREEN}logged in${C_RESET}"
+  else
+    status="${C_DIM}logged out${C_RESET}"
+  fi
+
+  # Mark the account this shell is currently pointed at.
+  local current="${CLAUDE_CONFIG_DIR:-}"
+  if [ -n "$current" ] && [ -n "$dir" ] && [ "$current" = "$dir" ]; then
+    marker=" ${C_CYAN}*${C_RESET}"
+  elif [ -z "$current" ] && [ -z "$dir" ]; then
+    marker=" ${C_CYAN}*${C_RESET}"
+  fi
+
+  printf '%-18s %-34s %-10s %b%b\n' "$name" "$email" "$plan" "$status" "$marker"
+}
+
+cmd_status() {
+  local name="${1-}"
+  require_claude
+
+  local dir="" label
+  if [ -z "$name" ] || [ "$name" = "default" ]; then
+    label="default"
+  else
+    require_account "$name"
+    dir="$(account_dir "$name")" || exit 1
+    label="$name"
+  fi
+
+  local json; json="$(auth_status_json "$dir")"
+  local logged email plan org method
+  logged="$(json_bool "$json" loggedIn)"
+  email="$(json_str "$json" email)"
+  plan="$(json_str "$json" subscriptionType)"
+  org="$(json_str "$json" orgName)"
+  method="$(json_str "$json" authMethod)"
+
+  printf '%sAccount%s   %s\n' "$C_BOLD" "$C_RESET" "$label"
+  if [ -n "$dir" ]; then
+    printf '%sDirectory%s %s\n' "$C_BOLD" "$C_RESET" "$dir"
+  else
+    printf '%sDirectory%s %s\n' "$C_BOLD" "$C_RESET" "(Claude Code default — CLAUDE_CONFIG_DIR is not set)"
+  fi
+
+  if [ "$logged" = "true" ]; then
+    printf '%sStatus%s    %slogged in%s\n' "$C_BOLD" "$C_RESET" "$C_GREEN" "$C_RESET"
+    [ -n "$email" ]  && printf '%sEmail%s     %s\n' "$C_BOLD" "$C_RESET" "$email"
+    [ -n "$plan" ]   && printf '%sPlan%s      %s\n' "$C_BOLD" "$C_RESET" "$plan"
+    [ -n "$org" ]    && printf '%sOrg%s       %s\n' "$C_BOLD" "$C_RESET" "$org"
+    [ -n "$method" ] && printf '%sMethod%s    %s\n' "$C_BOLD" "$C_RESET" "$method"
+    return 0
+  fi
+
+  printf '%sStatus%s    %slogged out%s\n' "$C_BOLD" "$C_RESET" "$C_YELLOW" "$C_RESET"
+  if [ -n "$dir" ]; then
+    printf '\nSign in with: %s %s\n' "$PROG" "$label"
+  fi
+  return 1
+}
+
+cmd_remove() {
+  local name="" assume_yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) assume_yes=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option for 'remove': $1" ;;
+      *)  [ -z "$name" ] || die "'remove' takes exactly one account name"; name="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$name" ] || die "usage: $PROG remove <name>"
+  validate_name "$name"
+
+  if [ "$name" = "default" ]; then
+    die "'default' is the built-in Claude Code account and cannot be removed"
+  fi
+
+  require_account "$name"
+  local dir; dir="$(account_dir "$name")" || exit 1
+
+  # Final safety net: never delete anything that is not an account directory.
+  assert_removable "$dir"
+
+  if [ "$assume_yes" -eq 0 ]; then
+    if [ ! -t 0 ]; then
+      die "refusing to remove '$name' without confirmation (re-run with --yes)"
+    fi
+    printf 'Remove account %s and its stored session at %s? [y/N] ' "$name" "$dir" >&2
+    local reply; read -r reply
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) info "aborted"; return 1 ;;
+    esac
+  fi
+
+  rm -rf -- "$dir" || die "could not remove $dir"
+  info "${C_GREEN}removed${C_RESET} account '$name'"
+  info "Your default ~/.claude installation was not touched."
+}
+
+# assert_removable <dir> — hard guard around every destructive operation.
+assert_removable() {
+  local dir="$1"
+  local parent base
+  parent="$(dirname -- "$dir")"
+  base="$(basename -- "$dir")"
+
+  [ "$parent" = "$ACCOUNTS_HOME" ] || die "refusing to delete '$dir': not inside $ACCOUNTS_HOME"
+  [ -n "$base" ] || die "refusing to delete an empty path"
+  case "$base" in .|..|"") die "refusing to delete '$dir'" ;; esac
+  [ "$dir" != "$HOME" ] || die "refusing to delete \$HOME"
+  [ "$dir" != "$HOME/.claude" ] || die "refusing to delete ~/.claude"
+  [ "$dir" != "$ACCOUNTS_HOME" ] || die "refusing to delete the accounts root"
+  [ "$dir" != "/" ] || die "refusing to delete /"
+  [ -d "$dir" ] || die "'$dir' is not a directory"
+}
+
+cmd_rename() {
+  local old="${1-}" new="${2-}"
+  if [ -z "$old" ] || [ -z "$new" ]; then
+    die "usage: $PROG rename <old> <new>"
+  fi
+
+  validate_name "$old"
+  validate_name "$new"
+  reject_reserved "$new"
+
+  [ "$old" != "default" ] || die "'default' is the built-in Claude Code account and cannot be renamed"
+  [ "$old" != "$new" ] || die "the new name is the same as the old one"
+
+  require_account "$old"
+  account_exists "$new" && die "account '$new' already exists"
+
+  local from to
+  from="$(account_dir "$old")" || exit 1
+  to="$(account_dir "$new")" || exit 1
+
+  mv -- "$from" "$to" || die "could not rename $from to $to"
+  info "${C_GREEN}renamed${C_RESET} '$old' -> '$new'"
+}
+
+cmd_path() {
+  local name="${1-}"
+  [ -n "$name" ] || die "usage: $PROG path <name>"
+  if [ "$name" = "default" ]; then
+    printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    return 0
+  fi
+  require_account "$name"
+  account_dir "$name" && printf '\n'
+}
+
+# Prints the export line. It is printed, never evaluated by this tool.
+cmd_env() {
+  local name="${1-}"
+  [ -n "$name" ] || die "usage: $PROG env <name>"
+  if [ "$name" = "default" ]; then
+    printf 'unset CLAUDE_CONFIG_DIR\n'
+    return 0
+  fi
+  require_account "$name"
+  local dir; dir="$(account_dir "$name")" || exit 1
+  printf 'export CLAUDE_CONFIG_DIR=%q\n' "$dir"
+}
+
+# Opens a subshell already pointed at the account — a real "switch" without eval.
+cmd_shell() {
+  local name="${1-}"
+  [ -n "$name" ] || die "usage: $PROG shell <name>"
+  local sh="${SHELL:-/bin/sh}"
+
+  if [ "$name" = "default" ]; then
+    info "Opening a shell using the default Claude Code account. Type 'exit' to leave."
+    exec env -u CLAUDE_CONFIG_DIR CLAUDE_ACCOUNT="default" "$sh"
+  fi
+
+  require_account "$name"
+  local dir; dir="$(account_dir "$name")" || exit 1
+  info "Opening a shell using account '$name'. Type 'exit' to leave."
+  exec env CLAUDE_CONFIG_DIR="$dir" CLAUDE_ACCOUNT="$name" "$sh"
+}
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}claude-account${C_RESET} $VERSION — run several Claude Code accounts side by side.
+
+${C_BOLD}USAGE${C_RESET}
+  $PROG <command> [args]
+  $PROG <account> [claude args...]
+
+${C_BOLD}COMMANDS${C_RESET}
+  add <name> [--no-login]   Create an account and sign in to it
+  list                      Show every account with its email, plan and status
+  use <name> [args...]      Run Claude Code as <name>
+  <name> [args...]          Shorthand for 'use <name>'
+  default [args...]         Run plain Claude Code (CLAUDE_CONFIG_DIR unset)
+  status [name]             Show sign-in details for one account
+  remove <name> [--yes]     Delete a stored account session
+  rename <old> <new>        Rename an account
+  path <name>               Print the account's config directory
+  env <name>                Print the export line for that account
+  shell <name>              Open a subshell pointed at that account
+  help, version
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $PROG add work
+  $PROG add personal
+  $PROG list
+  $PROG work                         # interactive session on the work account
+  $PROG work -p "summarise README"   # arguments pass straight through
+  $PROG use personal --model opus
+  $PROG default                      # your normal, untouched Claude Code
+  $PROG status work
+
+${C_BOLD}HOW IT WORKS${C_RESET}
+  Every account is its own CLAUDE_CONFIG_DIR under
+    $ACCOUNTS_HOME/<name>
+  and Claude Code runs as:
+    CLAUDE_CONFIG_DIR=$ACCOUNTS_HOME/<name> claude ...
+
+  HOME is never changed, so the macOS Keychain keeps behaving normally.
+  The reserved account 'default' runs Claude Code with CLAUDE_CONFIG_DIR unset,
+  which is your existing ~/.claude installation.
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+  CLAUDE_ACCOUNTS_HOME   Where accounts live (default: \$HOME/.claude-accounts)
+  CLAUDE_BIN             Claude Code executable (default: claude)
+  NO_COLOR               Disable coloured output
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  if [ $# -eq 0 ]; then
+    cmd_help
+    exit 0
+  fi
+
+  local cmd="$1"; shift
+
+  case "$cmd" in
+    add)                cmd_add "$@" ;;
+    list|ls)            cmd_list "$@" ;;
+    status)             cmd_status "${1-}" ;;
+    remove|rm|delete)   cmd_remove "$@" ;;
+    rename|mv)          cmd_rename "${1-}" "${2-}" ;;
+    path)               cmd_path "${1-}" ;;
+    env)                cmd_env "${1-}" ;;
+    shell)              cmd_shell "${1-}" ;;
+    default)            run_default "$@" ;;
+    use|run)
+      local name="${1-}"
+      [ -n "$name" ] || die "usage: $PROG use <name> [claude args...]"
+      shift
+      if [ "$name" = "default" ]; then
+        run_default "$@"
+      else
+        run_account "$name" "$@"
+      fi
+      ;;
+    help|--help|-h)     cmd_help ;;
+    version|--version|-V) printf '%s %s\n' "$PROG" "$VERSION" ;;
+    -*)                 die "unknown option: $cmd (try '$PROG help')" ;;
+    *)
+      # Bare account name: claude-account work [args...]
+      validate_name "$cmd"
+      if account_exists "$cmd"; then
+        run_account "$cmd" "$@"
+      else
+        die "unknown command or account: '$cmd' (try '$PROG list' or '$PROG help')"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
