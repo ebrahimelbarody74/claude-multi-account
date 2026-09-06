@@ -149,7 +149,7 @@ AssertFail     'add rejects an unknown option' @('add','x','--bogus')
 
 # ---------------------------------------------------------------------------
 Group 'path traversal and hostile names'
-$evilNames = @('../evil','../../etc/passwd','/etc/passwd','a/b','.hidden','-rf','..','.','a b','a;b','a`b','a|b','a&b','a>b','a*','a?','a\b','~root','C:\Windows','CON','NUL','LPT1','a"b',"a'b")
+$evilNames = @('../evil','../../etc/passwd','/etc/passwd','a/b','.hidden','-rf','..','.','a b','a;b','a`b','a|b','a&b','a>b','a*','a?','a\b','~root','C:\Windows','CON','NUL','LPT1')
 foreach ($evil in $evilNames) {
     AssertFail "rejects add '$evil'"    @('add', $evil)
     AssertFail "rejects remove '$evil'" @('remove','--yes', $evil)
@@ -157,8 +157,27 @@ foreach ($evil in $evilNames) {
     AssertFail "rejects path '$evil'"   @('path', $evil)
 }
 AssertFail 'rejects an over-long name' @('add', ('a' * 200))
+
+# Names containing quotes cannot be asserted on the child's exit code: Windows
+# argument marshalling (CommandLineToArgvW) strips an embedded quote before the
+# script is ever started, so `a"b` arrives as the perfectly legal name `ab`.
+# The property that actually matters is that no illegally-named account
+# directory can come into existence, so assert that directly.
+foreach ($q in @('a"b', "a'b", 'a`"b')) { RunCli @('add', $q) | Out-Null }
+$illegal = @(Get-ChildItem -LiteralPath $env:CLAUDE_ACCOUNTS_HOME -Directory |
+             Where-Object { $_.Name -notmatch '^[A-Za-z0-9._-]+$' })
+if ($illegal.Count -eq 0) {
+    Ok 'no illegally-named account directory can be created'
+} else {
+    Bad 'no illegally-named account directory can be created' ($illegal.Name -join ', ')
+}
+# Drop anything the marshalling legitimised, so the expected set is restored.
+Get-ChildItem -LiteralPath $env:CLAUDE_ACCOUNTS_HOME -Directory |
+    Where-Object { $_.Name -notin @('work','nologin') } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+
 $dirCount = @(Get-ChildItem -LiteralPath $env:CLAUDE_ACCOUNTS_HOME -Directory).Count
-if ($dirCount -eq 2) { Ok 'no directory was created outside accounts' } else { Bad 'no directory was created outside accounts' "found $dirCount" }
+if ($dirCount -eq 2) { Ok 'only the two real accounts exist' } else { Bad 'only the two real accounts exist' "found $dirCount" }
 if (-not (Test-Path -LiteralPath (Join-Path $Work 'evil'))) { Ok 'nothing escaped the accounts root' } else { Bad 'nothing escaped the accounts root' }
 
 # ---------------------------------------------------------------------------
@@ -255,3 +274,6 @@ Write-Host "passed: $($script:Pass)   failed: $($script:Fail)"
 Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
 if ($script:Fail -gt 0) { exit 1 }
 Write-Host 'all tests passed' -ForegroundColor Green
+# Explicit: without this the script inherits $LASTEXITCODE from the last child
+# process, and the last assertion deliberately expects a non-zero exit.
+exit 0

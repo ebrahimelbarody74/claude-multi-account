@@ -127,7 +127,9 @@ assert_fail     'add with no name fails' "$CLI" add
 assert_fail     'add rejects two names' "$CLI" add a b
 assert_fail     'add rejects unknown option' "$CLI" add x --bogus
 
-perms="$(stat -f '%Lp' "$CLAUDE_ACCOUNTS_HOME" 2>/dev/null || stat -c '%a' "$CLAUDE_ACCOUNTS_HOME" 2>/dev/null)"
+# GNU stat first: on Linux `stat -f` means "filesystem status" and succeeds,
+# so a BSD-first order would never fall through.
+perms="$(stat -c '%a' "$CLAUDE_ACCOUNTS_HOME" 2>/dev/null || stat -f '%Lp' "$CLAUDE_ACCOUNTS_HOME" 2>/dev/null)"
 if [ "$perms" = "700" ]; then ok 'accounts root is 0700'; else bad 'accounts root is 0700' "got $perms"; fi
 
 # ---------------------------------------------------------------------------
