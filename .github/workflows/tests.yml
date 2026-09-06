@@ -1,0 +1,92 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  bash:
+    name: bash (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n bin/claude-account
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n tests/run-tests.sh
+
+      - name: Run the test suite
+        run: ./tests/run-tests.sh
+
+      - name: Install and uninstall in a sandbox
+        run: |
+          set -euo pipefail
+          FAKE_HOME="$(mktemp -d)"
+          mkdir -p "$FAKE_HOME/.claude"
+          echo sentinel > "$FAKE_HOME/.claude/sentinel"
+          mkdir -p "$FAKE_HOME/.claude-accounts/keepme"
+
+          HOME="$FAKE_HOME" INSTALL_DIR="$FAKE_HOME/bin" NO_MODIFY_PATH=1 ./install.sh
+          test -x "$FAKE_HOME/bin/claude-account"
+          HOME="$FAKE_HOME" "$FAKE_HOME/bin/claude-account" version
+
+          HOME="$FAKE_HOME" INSTALL_DIR="$FAKE_HOME/bin" ./uninstall.sh
+          test ! -e "$FAKE_HOME/bin/claude-account"
+          test -f "$FAKE_HOME/.claude/sentinel"          # ~/.claude survived
+          test -d "$FAKE_HOME/.claude-accounts/keepme"   # accounts survived
+          echo "install/uninstall cycle OK"
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning bin/claude-account install.sh uninstall.sh tests/run-tests.sh
+
+  powershell:
+    name: powershell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse check
+        shell: pwsh
+        run: |
+          foreach ($f in @('powershell/claude-account.ps1','install.ps1','uninstall.ps1','tests/run-tests.ps1')) {
+            $errs = $null; $toks = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$toks, [ref]$errs) | Out-Null
+            if ($errs) { $errs | ForEach-Object { Write-Host $_ }; throw "parse errors in $f" }
+            Write-Host "$f OK"
+          }
+
+      - name: Run the test suite
+        shell: pwsh
+        run: ./tests/run-tests.ps1
+
+  powershell-51:
+    name: Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the test suite on the built-in 5.1
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion
+          .\tests\run-tests.ps1
