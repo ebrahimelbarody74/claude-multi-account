@@ -328,7 +328,7 @@ function Invoke-List {
         Write-AccountRow $d.Name $d.FullName (Get-AuthStatus $d.FullName)
     }
 
-    $links = Get-Links
+    $links = @(Get-Links)
     if ($links.Count -gt 0) {
         Write-Host ''
         Write-Host 'Shortcuts'
@@ -620,7 +620,9 @@ function Invoke-Unlink {
 }
 
 function Invoke-Links {
-    $links = Get-Links
+    # @() at the call site: Windows PowerShell 5.1 unwraps a one-element array
+    # returned from a function, and StrictMode then rejects .Count on the scalar.
+    $links = @(Get-Links)
     if ($links.Count -eq 0) {
         Write-Info "No shortcuts yet. Create one with: $($script:Prog) link work claude1"
         return
